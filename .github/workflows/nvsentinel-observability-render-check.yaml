@@ -30,9 +30,12 @@
 # to and that server's volume and images, the system-namespaces one asserts
 # the chart's default list still matches the one the drain scope keeps, the
 # node-validation one asserts lifecycle-manager's workload, its new-node
-# criteria and tests, and the DCGM address its dcgm-diag-test calls, and the
-# CRD exclusion one asserts every component's ownsCRDsExcludeSubcharts
-# (nvsentinel's and nktp's) still matches its pinned chart.
+# criteria and tests, and the DCGM address its dcgm-diag-test calls, the
+# external-remediation one asserts the ExternalRemediationRequest action, its
+# template and RBAC render only with its mixin, and that kubernetes-object-monitor
+# prints a declared policy's enabled and isFatal verbatim, and the CRD exclusion
+# one asserts every component's ownsCRDsExcludeSubcharts (nvsentinel's and
+# nktp's) still matches its pinned chart.
 # All are gated on testing.Short() -- `make
 # test`/`make qualify`/every other CI job run with -short, so this is the only
 # place they execute. There is no PR-blocking trigger here on purpose: these
@@ -108,6 +111,7 @@ jobs:
             TestNVSentinelHealthEventsAnalyzerChartRender
             TestNVSentinelEventExporterChartRender
             TestNVSentinelLogCollectorChartRender
+            TestNVSentinelExternalRemediationChartRender
             TestNVSentinelChartSystemNamespacesDefault
             TestNVSentinelNodeValidationChartRender
           )
