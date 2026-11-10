@@ -68,8 +68,9 @@ RUNAI_PROJECT_CPU_MILLICORES="${RUNAI_PROJECT_CPU_MILLICORES:-4000}"
 RUNAI_PROJECT_MEMORY_MIB="${RUNAI_PROJECT_MEMORY_MIB:-8192}"
 # Names. The cluster record and the Project default to the run id so concurrent
 # runs against one control plane cannot collide; both are overridable for local
-# reproduction. Run:ai names the Project namespace runai-<project>, and the
-# harness pins that with requestedNamespace rather than inferring it.
+# reproduction. Run:ai creates the Project namespace as runai-<project>. The
+# harness does not ask for it by name: a requestedNamespace makes the cluster
+# treat the namespace as one that already exists, and never create it.
 RUNAI_CLUSTER_NAME="${RUNAI_CLUSTER_NAME:-}"
 RUNAI_PROJECT_NAME="${RUNAI_PROJECT_NAME:-}"
 # Where the chart's registration hooks look for the cluster-domain
@@ -467,9 +468,26 @@ runai_bundle_values_file() {
   printf '%s' "${matches[0]}"
 }
 
+# runai_enable_cpu_quota turns on the control plane's CPU quota setting when it
+# is off (the default). With it off the Projects API answers 400 to any CPU or
+# memory quota. The setting is tenant-wide and stays on. Requires RUNAI_TOKEN.
+runai_enable_cpu_quota() {
+  local setting
+  setting="$(runai_api GET /api/v1/node-pools/settings/cpuResourcesQuota)" || return 1
+  if [[ "$(printf '%s' "${setting}" | jq -r '.enabled' 2>/dev/null)" == "true" ]]; then
+    return 0
+  fi
+  runai_api PUT /api/v1/node-pools/settings/cpuResourcesQuota '{"enabled":true}' >/dev/null || {
+    echo "::error::Run:ai: enabling the CPU quota setting (cpuResourcesQuota) failed" >&2; return 1; }
+  echo "Run:ai: enabled the control plane's CPU quota setting (cpuResourcesQuota)"
+}
+
 # runai_create_project creates the Run:ai Project the gang test runs in, with an
-# explicit CPU and memory quota on the cluster's default node pool, and pins its
-# namespace (runai-<name>) in the state. Idempotent on re-run.
+# explicit CPU and memory quota on the cluster's default node pool, and records
+# the namespace Run:ai creates for it (runai-<name>) in the state. Idempotent on
+# re-run. The body carries no overQuotaWeight: a control plane with the
+# over-quota setting off (the default) answers 400 to any value other than the
+# deserved one.
 runai_create_project() {
   local uuid name ns pool_id project_id
   uuid="$(runai_state_get .clusterUuid)"
@@ -493,15 +511,16 @@ runai_create_project() {
     echo "::error::Run:ai: cluster ${uuid} reports no default node pool yet: $(printf '%s' "${pools}" | head -c 300)" >&2
     return 1
   fi
+  runai_enable_cpu_quota || return 1
   local body created
-  body="$(jq -n --arg n "${name}" --arg c "${uuid}" --arg ns "${ns}" --arg p "${pool_id}" \
+  body="$(jq -n --arg n "${name}" --arg c "${uuid}" --arg p "${pool_id}" \
     --argjson cpu "${RUNAI_PROJECT_CPU_MILLICORES}" --argjson mem "${RUNAI_PROJECT_MEMORY_MIB}" '{
-      name: $n, clusterId: $c, requestedNamespace: $ns,
+      name: $n, clusterId: $c,
       resources: [{
         nodePool: {id: $p, name: "default"},
-        gpu:    {deserved: 0, limit: null, overQuotaWeight: 2},
-        cpu:    {deserved: $cpu, limit: null, overQuotaWeight: 2},
-        memory: {deserved: $mem, limit: null, overQuotaWeight: 2, units: "Mib"}
+        gpu:    {deserved: 0, limit: null},
+        cpu:    {deserved: $cpu, limit: null},
+        memory: {deserved: $mem, limit: null, units: "Mib"}
       }]
     }')"
   created="$(runai_api POST /api/v1/org-unit/projects "${body}")" || {

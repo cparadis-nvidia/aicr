@@ -262,22 +262,57 @@ d="${WORK}/project"; mkdir -p "${d}/responses"
 jq -n '{clusterUuid:"u-1", clusterUrl:"https://c"}' > "${d}/runai-harness.json"
 printf '%s' "${token_json}" > "${d}/responses/1.json"
 printf '%s' '{"nodepools":[{"id":"7","name":"default","clusterId":"u-1","isDefault":true}]}' > "${d}/responses/2.json"
-printf '%s' '{"id":"42","name":"aicr-uat-12345","requestedNamespace":"runai-aicr-uat-12345","status":{"phase":"Creating"}}' > "${d}/responses/3.json"
+printf '%s' '{"enabled":true}' > "${d}/responses/3.json"
+printf '%s' '{"id":"42","name":"aicr-uat-12345","status":{"phase":"Creating"}}' > "${d}/responses/4.json"
 run_case "${d}" 'runai_create_project'; rc=$?
 if [[ "${rc}" == 0 ]] \
    && grep -q 'url = "https://cp.example.test/api/v1/node-pools?filterBy=clusterId==u-1"' "${d}/stub.curl" \
    && grep -q 'url = "https://cp.example.test/api/v1/org-unit/projects"' "${d}/stub.curl" \
-   && [[ "$(jq -c '{name,clusterId,requestedNamespace,np:.resources[0].nodePool.id,cpu:.resources[0].cpu.deserved,mem:.resources[0].memory.deserved,units:.resources[0].memory.units,gpu:.resources[0].gpu.deserved}' "${d}/stub.body-3")" == '{"name":"aicr-uat-12345","clusterId":"u-1","requestedNamespace":"runai-aicr-uat-12345","np":"7","cpu":4000,"mem":8192,"units":"Mib","gpu":0}' ]] \
+   && ! grep -q 'request = "PUT"' "${d}/stub.curl" \
+   && [[ "$(jq -c '{name,clusterId,np:.resources[0].nodePool.id,cpu:.resources[0].cpu.deserved,mem:.resources[0].memory.deserved,units:.resources[0].memory.units,gpu:.resources[0].gpu.deserved}' "${d}/stub.body-4")" == '{"name":"aicr-uat-12345","clusterId":"u-1","np":"7","cpu":4000,"mem":8192,"units":"Mib","gpu":0}' ]] \
+   && [[ "$(jq -c '[.. | objects | has("overQuotaWeight")] | any' "${d}/stub.body-4")" == "false" ]] \
+   && [[ "$(jq -r 'has("requestedNamespace")' "${d}/stub.body-4")" == "false" ]] \
    && [[ "$(jq -r .projectId "${d}/runai-harness.json")" == "42" ]] \
    && [[ "$(jq -r .projectNamespace "${d}/runai-harness.json")" == "runai-aicr-uat-12345" ]]; then
-    pass "the Project is created on the default node pool with an explicit CPU/memory quota, no GPU, and a pinned runai-<name> namespace"
+    pass "the Project is created on the default node pool with an explicit CPU/memory quota, no GPU, no over-quota weight and no requested namespace, and runai-<name> is recorded as its namespace"
 else
-    fail "project: rc=${rc} log=$(cat "${d}/log") body=$(cat "${d}/stub.body-3" 2>/dev/null)"
+    fail "project: rc=${rc} log=$(cat "${d}/log") body=$(cat "${d}/stub.body-4" 2>/dev/null)"
 fi
 run_case "${d}" 'runai_create_project'; rc=$?
-[[ "${rc}" == 0 && "$(cat "${d}/stub.curl-count")" == 3 ]] \
+[[ "${rc}" == 0 && "$(cat "${d}/stub.curl-count")" == 4 ]] \
     && pass "a re-run does not create a second Project" \
     || fail "project idempotency: rc=${rc} calls=$(cat "${d}/stub.curl-count")"
+
+d="${WORK}/project-cpuquota-off"; mkdir -p "${d}/responses"
+jq -n '{clusterUuid:"u-1", clusterUrl:"https://c"}' > "${d}/runai-harness.json"
+printf '%s' "${token_json}" > "${d}/responses/1.json"
+printf '%s' '{"nodepools":[{"id":"7","name":"default","clusterId":"u-1","isDefault":true}]}' > "${d}/responses/2.json"
+printf '%s' '{"enabled":false}' > "${d}/responses/3.json"
+printf '%s' '{"enabled":true}' > "${d}/responses/4.json"
+printf '%s' '{"id":"43"}' > "${d}/responses/5.json"
+run_case "${d}" 'runai_create_project'; rc=$?
+if [[ "${rc}" == 0 ]] \
+   && [[ "$(grep -c 'url = "https://cp.example.test/api/v1/node-pools/settings/cpuResourcesQuota"' "${d}/stub.curl")" == 2 ]] \
+   && [[ "$(grep -c 'request = "PUT"' "${d}/stub.curl")" == 1 ]] \
+   && [[ "$(jq -c . "${d}/stub.body-4")" == '{"enabled":true}' ]] \
+   && grep -q 'enabled the control plane' "${d}/log" \
+   && [[ "$(jq -r .projectId "${d}/runai-harness.json")" == "43" ]]; then
+    pass "a control plane with the CPU quota setting off has it enabled before the Project is created"
+else
+    fail "project cpu quota off: rc=${rc} log=$(cat "${d}/log")"
+fi
+
+d="${WORK}/project-cpuquota-refused"; mkdir -p "${d}/responses"
+jq -n '{clusterUuid:"u-1", clusterUrl:"https://c"}' > "${d}/runai-harness.json"
+printf '%s' "${token_json}" > "${d}/responses/1.json"
+printf '%s' '{"nodepools":[{"id":"7","name":"default","clusterId":"u-1","isDefault":true}]}' > "${d}/responses/2.json"
+printf '%s' '{"enabled":false}' > "${d}/responses/3.json"
+printf '%s' '{"code":403,"message":"forbidden"}' > "${d}/responses/4.json"; echo 22 > "${d}/responses/4.rc"
+run_case "${d}" 'runai_create_project'; rc=$?
+[[ "${rc}" != 0 ]] && grep -q 'enabling the CPU quota setting' "${d}/log" && [[ "$(cat "${d}/stub.curl-count")" == 4 ]] \
+   && [[ "$(jq -r '.projectId // ""' "${d}/runai-harness.json")" == "" ]] \
+    && pass "a refused CPU quota setting stops the phase before any Project is created" \
+    || fail "project cpu quota refused: rc=${rc} calls=$(cat "${d}/stub.curl-count") log=$(cat "${d}/log")"
 
 d="${WORK}/project-nopool"; mkdir -p "${d}/responses"
 jq -n '{clusterUuid:"u-1"}' > "${d}/runai-harness.json"
