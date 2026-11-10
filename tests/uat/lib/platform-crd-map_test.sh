@@ -38,6 +38,8 @@ check "kubeflow maps to its CRD" \
     "trainjobs.trainer.kubeflow.org" "$(platform_workload_crd kubeflow)"
 check "slurm maps to the Slinky NodeSet CRD" \
     "nodesets.slinky.slurm.net" "$(platform_workload_crd slurm)"
+check "runai maps to the Run:ai operator's RunaiConfig CRD" \
+    "runaiconfigs.run.ai" "$(platform_workload_crd runai)"
 
 # An unknown platform must return non-zero AND empty stdout. Asserting only
 # the empty string would pass even if the function returned 0, which is the
@@ -51,7 +53,7 @@ check "unknown platform returns rc=1" "1" "${rc}"
 # each name back through platform_workload_crd. A name the lookup cannot
 # resolve silently drops that platform's CRs from the debug bundle.
 check "enumeration lists the known platforms in map order" \
-    "dynamo kubeflow slurm" \
+    "dynamo kubeflow slurm runai" \
     "$(platform_workload_platforms | tr '\n' ' ' | sed 's/ $//')"
 
 resolved=""
@@ -60,7 +62,7 @@ for p in $(platform_workload_platforms); do
     resolved="${resolved}${resolved:+ }${crd}"
 done
 check "every enumerated platform resolves through the lookup" \
-    "dynamographdeployments.nvidia.com trainjobs.trainer.kubeflow.org nodesets.slinky.slurm.net" \
+    "dynamographdeployments.nvidia.com trainjobs.trainer.kubeflow.org nodesets.slinky.slurm.net runaiconfigs.run.ai" \
     "${resolved}"
 
 exit "${fail}"

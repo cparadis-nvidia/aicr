@@ -293,6 +293,42 @@ data "aws_iam_policy_document" "github_actions_permissions" {
       "arn:aws:dynamodb:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:table/cluster-state-lock",
     ]
   }
+
+  # Run:ai control-plane harness credential (platform=runai UAT cells,
+  # NVIDIA/aicr#3302): read-only, this one secret. Secrets Manager appends a
+  # random suffix to the ARN, hence the trailing wildcard on the name.
+  statement {
+    sid    = "RunaiHarnessSecretRead"
+    effect = "Allow"
+    actions = [
+      "secretsmanager:GetSecretValue",
+    ]
+    resources = [
+      aws_secretsmanager_secret.runai_harness.arn,
+    ]
+  }
+}
+
+# Run:ai control-plane harness credential for the platform=runai UAT cells
+# (NVIDIA/aicr#3302, "Validation contract"). uat-aws.yaml reads it through the
+# OIDC role above and publishes it to the phase steps masked
+# (tests/uat/lib/runai-harness.sh, runai_credential_export). Only the container
+# is managed here; the value, a JSON document
+#   {"url": "https://<control plane>", "clientId": "...", "clientSecret": "...",
+#    "caCert": "<PEM, optional>"}
+# is added out of band by whoever operates the control plane
+# (`aws secretsmanager put-secret-value --secret-id aicr-uat-runai-harness
+# --secret-string file://...`), so no credential ever passes through Terraform
+# state or a pull request.
+resource "aws_secretsmanager_secret" "runai_harness" {
+  name        = "aicr-uat-runai-harness"
+  description = "Run:ai control-plane service account for the platform=runai UAT cells (value added out of band)"
+
+  tags = {
+    Name        = "aicr-uat-runai-harness"
+    Environment = "ci"
+    ManagedBy   = "terraform"
+  }
 }
 
 # IAM Policy for GitHub Actions

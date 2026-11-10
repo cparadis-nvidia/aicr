@@ -46,6 +46,8 @@
 #                OpenAI-compatible endpoint, assert a completion, capture logs
 #                (intent=inference CUJ — the DC3 counterpart of `train`)
 #   verify       aicr evidence verify against the signed bundle
+#   unregister   delete the Run:ai cluster record and Project the harness created
+#                (platform=runai cells only; a no-op when prep registered nothing)
 #   debug        snapshot live cluster state into cluster-debug/ (nodes, taints,
 #                events, operator CRs incl. Skyhook status, operator/check-Job
 #                logs) — best-effort, run on failure BEFORE teardown
@@ -114,6 +116,11 @@ source "$(dirname "${BASH_SOURCE[0]}")/platform-crd-map.sh"
 # shellcheck source=./cuj-dispatch.sh
 source "$(dirname "${BASH_SOURCE[0]}")/cuj-dispatch.sh"
 source "$(dirname "${BASH_SOURCE[0]}")/fault-inject.sh"
+# Run:ai control-plane harness for platform=runai cells (#3302): cluster record,
+# bootstrap token, Project and namespace input for the gang-scheduling check.
+# Source guard: constants and functions only, no side effects at source time.
+# shellcheck source=./runai-harness.sh
+source "$(dirname "${BASH_SOURCE[0]}")/runai-harness.sh"
 
 # Train-job knobs (overridable for local reproduction or future inference variant).
 TRAINJOB_NAMESPACE="${TRAINJOB_NAMESPACE:-kubeflow}"
@@ -132,6 +139,11 @@ TRAINJOB_TIMEOUT_SECONDS="${TRAINJOB_TIMEOUT_SECONDS:-1200}" # 20 min
 # (tests/uat/kind/run) overrides to 1.
 TRAINJOB_NUM_NODES="${TRAINJOB_NUM_NODES:-2}"
 HELMFILE_TIMEOUT_SECONDS="${HELMFILE_TIMEOUT_SECONDS:-1200}" # 20 min
+# helm deployer (install_helm): one wall-clock budget for the bundle's deploy.sh,
+# which runs every component's install.sh in order with its own per-component
+# Helm timeout and retries. Wider than helmfile's because the runai-cluster
+# registration hooks (about 17 Jobs) run inside it.
+HELM_DEPLOY_TIMEOUT_SECONDS="${HELM_DEPLOY_TIMEOUT_SECONDS:-2400}" # 40 min
 # ArgoCD deployer knobs (see install_argocd). ARGOCD_HELM_TIMEOUT_SECONDS
 # bounds the `helm upgrade --install` of the argo-cd chart itself;
 # ARGOCD_SYNC_TIMEOUT_SECONDS bounds the wait for every Application to
@@ -673,8 +685,29 @@ phase_prep() {
         exit 1
       }
       ;;
+    helm)
+      # The helm deployer emits bundle/deploy.sh plus one directory per
+      # component, each with its install.sh. It is the only deployer the bundler
+      # admits for a recipe with an install-time secret (runai-cluster's
+      # bootstrap token), which is why the platform=runai configs select it. On
+      # such a recipe the control-plane harness registers this run's cluster
+      # first and the three registration values ride in as --set: a CLI --set
+      # replaces the config's deployment.set list, which these configs leave
+      # empty on purpose, and leaves deployment.dynamic (the token stub) alone.
+      local -a bundle_args=()
+      if uat_recipe_declares_runai; then
+        runai_prep_register
+        mapfile -t bundle_args < <(runai_bundle_args)
+      fi
+      "${AICR_BIN}" bundle --config "${config}" ${bundle_args[@]+"${bundle_args[@]}"}
+      test -f bundle/deploy.sh || {
+        echo "expected bundle/deploy.sh (deployer: helm) — got:" >&2
+        ls -la bundle >&2 || true
+        exit 1
+      }
+      ;;
     *)
-      echo "::error::unsupported deployer: ${deployer} (supported: helmfile, argocd)" >&2
+      echo "::error::unsupported deployer: ${deployer} (supported: helmfile, argocd, helm)" >&2
       exit 1
       ;;
   esac
@@ -744,8 +777,9 @@ phase_install() {
   case "${deployer}" in
     helmfile) install_helmfile ;;
     argocd)   install_argocd ;;
+    helm)     install_helm ;;
     *)
-      echo "::error::unsupported deployer: ${deployer} (supported: helmfile, argocd)" >&2
+      echo "::error::unsupported deployer: ${deployer} (supported: helmfile, argocd, helm)" >&2
       exit 1
       ;;
   esac
@@ -1228,6 +1262,64 @@ install_argocd() {
   exit 1
 }
 
+# install_helm runs the helm bundle's deploy.sh, which installs every component
+# in deploymentOrder through its own install.sh. On a recipe that declares
+# runai-cluster the Run:ai harness brackets the deploy: the namespace, the
+# cluster-domain TLS Secrets and the control-plane CA Secret go in first, the
+# bootstrap token is minted and written into the --dynamic stub right before
+# deploy.sh (install.sh refuses an empty stub) and cleared on every exit path
+# right after, and the Project for the gang test is created once the chart is
+# in. --no-wait mirrors the helmfile lane: deploy.sh returns when each release
+# is applied and the readiness gate owns convergence (#2630).
+install_helm() {
+  command -v helm    >/dev/null || { echo "helm not on PATH" >&2; exit 1; }
+  command -v kubectl >/dev/null || { echo "kubectl not on PATH" >&2; exit 1; }
+  test -x bundle/deploy.sh || { echo "::error::bundle/deploy.sh missing or not executable; run prep with deployer: helm first" >&2; exit 1; }
+
+  local runai=false values_file="" version=""
+  if uat_recipe_declares_runai bundle/recipe.yaml; then
+    runai=true
+    runai_require_env || exit 1
+    values_file="$(runai_bundle_values_file bundle)" || exit 1
+    version="$(uat_recipe_runai_version bundle/recipe.yaml)" || exit 1
+    runai_install_prepare || exit 1
+    echo "::group::Mint Run:ai bootstrap token"
+    runai_mint_token_into "${values_file}" "${version}" || { echo "::endgroup::"; exit 1; }
+    echo "::endgroup::"
+  fi
+
+  echo "::group::deploy.sh --no-wait (budget ${HELM_DEPLOY_TIMEOUT_SECONDS}s)"
+  local rc=0
+  # The token stub is cleared whatever deploy.sh does, including a budget kill
+  # or an interrupt, so the filled value never outlives the install step on the
+  # runner. The subshell's trap fires on its own EXIT; `|| rc=$?` keeps the
+  # caller's set -e from skipping the post-install diagnostics.
+  (
+    if [[ "${runai}" == true ]]; then
+      trap 'runai_clear_token "${values_file}"' EXIT
+    fi
+    cd bundle && timeout "${HELM_DEPLOY_TIMEOUT_SECONDS}" ./deploy.sh --no-wait
+  ) || rc=$?
+  echo "::endgroup::"
+  if (( rc != 0 )); then
+    if (( rc == 124 )); then
+      echo "::error::deploy.sh did not finish within ${HELM_DEPLOY_TIMEOUT_SECONDS}s" >&2
+    else
+      echo "::error::deploy.sh failed (rc=${rc})" >&2
+    fi
+    if [[ "${runai}" == true ]]; then
+      kubectl -n "${RUNAI_NAMESPACE}" get jobs,pods 2>&1 | head -40 >&2 || true
+    fi
+    exit "${rc}"
+  fi
+
+  if [[ "${runai}" == true ]]; then
+    echo "::group::Create Run:ai Project for the gang-scheduling check"
+    runai_create_project || { echo "::endgroup::"; exit 1; }
+    echo "::endgroup::"
+  fi
+}
+
 # readiness_gate_report_extract: PURE, unit-testable. $1 is the CTRF report one
 # gate attempt wrote. Prints each non-passed test's name, status, message and
 # stdout lines -- the validator Job's own diagnosis (e.g. expected-resources'
@@ -1536,6 +1628,14 @@ phase_conformance() {
   # install_readiness_gate). The emitted evidence binds predicate.recipe.digest
   # to that file, so recipe-evidence-check.sh reports these rows as stale
   # against the overlay digest until the comparison follows (#2848 follow-up).
+  # On a runai recipe the gang-scheduling check runs in the Run:ai Project
+  # namespace the install phase created, named through
+  # AICR_RUNAI_PROJECT_NAMESPACE (forwarded by the orchestrator to that check
+  # only). The check fails, rather than skips, without it, so the wait for the
+  # namespace fails this phase with its own reason instead.
+  if uat_recipe_declares_runai bundle/recipe.yaml; then
+    runai_export_project_namespace || exit 1
+  fi
   local -a validate_args=(--config "${config}" --recipe bundle/recipe.yaml --phase "${VALIDATE_PHASES}" --output report.json)
   if [[ "${UAT_ALLOW_MUTABLE_VALIDATOR_TAGS:-}" == "true" ]]; then
     validate_args+=(--allow-mutable-validator-tags)
@@ -1975,7 +2075,7 @@ uat_main() {
 
   if [[ -z "${phase}" || -z "${config}" ]]; then
     echo "Usage: $0 <phase> <test-config.yaml>" >&2
-    echo "Phases: prep | install | readiness | conformance | train | serve | verify | faultinject | debug | all" >&2
+    echo "Phases: prep | install | readiness | conformance | train | serve | verify | faultinject | unregister | debug | all" >&2
     exit 2
   fi
 
@@ -1996,6 +2096,7 @@ uat_main() {
     serve)       phase_serve ;;
     verify)      phase_verify ;;
     faultinject) phase_fault_inject ;;
+    unregister)  phase_unregister ;;
     debug)
       # Refresh cloud credentials first (no-op on AWS/GCP; Azure redeems a fresh
       # federated session). A failure that surfaces after a long phase can leave a
@@ -2036,10 +2137,16 @@ uat_main() {
           ;;
       esac
       phase_verify
+      # The Run:ai harness leaves nothing behind in the shared control plane
+      # when the whole flow ran here; the workflows run this as their own
+      # always() step so a failed phase still unregisters.
+      if uat_recipe_declares_runai; then
+        phase_unregister
+      fi
       ;;
     *)
       echo "unknown phase: ${phase}" >&2
-      echo "Phases: prep | install | readiness | conformance | train | serve | verify | faultinject | debug | all" >&2
+      echo "Phases: prep | install | readiness | conformance | train | serve | verify | faultinject | unregister | debug | all" >&2
       exit 2
       ;;
   esac

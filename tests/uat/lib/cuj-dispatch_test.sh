@@ -40,6 +40,10 @@ check "slurm training runs NO kubeflow CUJ" \
     "none" "$(cuj_phase_for training slurm)"
 check "slurm inference also runs no CUJ" \
     "none" "$(cuj_phase_for inference slurm)"
+check "runai training runs no Kubeflow CUJ" \
+    "none" "$(cuj_phase_for training runai)"
+check "runai inference also runs no CUJ" \
+    "none" "$(cuj_phase_for inference runai)"
 check "unset platform still defaults to training behaviour" \
     "train" "$(cuj_phase_for training '')"
 # The inference half of the same compatibility promise. Its sibling above only

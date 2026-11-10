@@ -77,6 +77,8 @@ fi
 # same over-limit objects.
 if [[ -n "${DEPLOYMENT_ID:-}" && -n "${2:-}" && -f "${2}" ]]; then
   recipe_criteria="$(yq -r '[.spec.recipe.criteria.service, .spec.recipe.criteria.accelerator, .spec.recipe.criteria.platform] | join("/")' "${2}")"
+  # kubeflow only: `aicr recipe` accepts tcpxoInterfaces for no other platform
+  # (the runai config carries none, see its header).
   if [[ "${recipe_criteria}" == "gke/h100/kubeflow" ]]; then
     # One deterministic path per run, rewritten per phase — no temp-file
     # accumulation across phases or repeated local runs.

@@ -60,6 +60,13 @@ on:
         description: 'GPU accelerator family (from the reservation); selects the test config <accelerator>-<intent>-config.yaml.'
         type: string
         default: h100
+      platform:
+        description: >-
+          Recipe platform: appends a -<platform> segment to the test-config filename.
+          Empty selects the default per-intent config; runai selects
+          <accelerator>-<intent>-runai-config.yaml (#3302). Bounded by Validate inputs.
+        type: string
+        default: ''
       skip_delete:
         description: 'Skip cluster teardown (manual runs only; the nightly batch always deletes).'
         type: boolean
@@ -120,6 +127,7 @@ jobs:
     #   helmfile+training:  prep 15 + install 25 + readiness 65 + validate 50 + train 25 + verify 5 + faultinject 10 = 195
     #   helmfile+inference: prep 15 + install 25 + readiness 65 + validate 50 + serve 40 + verify 5 + faultinject 10 = 210
     #   argocd+training:    prep 15 + install 45 + readiness 65 + validate 50 + train 25 + verify 5 + faultinject 10 = 215   (issue #2194, aws-h100 only)
+    #   helm+training (platform=runai, #3302): prep 15 + install 45 + readiness 65 + validate 50 + (no train) + verify 5 + faultinject 10 + unregister 5 = 195
     #   argocd+inference:   not shipped today; would be 15 + 45 + 65 + 50 + 40 + 5 + 10 = 230
     #   helmfile+training with nvsentinel_remediation=remediation (manual, #2625, #3089):
     #                       faultinject 55 instead of 10, for the post-reboot
@@ -173,19 +181,31 @@ jobs:
         && format('aicr-uat-day-{0}-{1}-{2}', inputs.slug, inputs.slot, github.run_id)
         || format('aicr-uat-{0}', github.run_id) }}
       CLUSTER_CONFIG: ${{ inputs.cluster_config_path }}
-      # The AICRConfig is selected by accelerator + intent + deployer:
+      # The AICRConfig is selected by accelerator + intent + platform + deployer:
       #   deployer=helmfile → <accelerator>-<intent>-config.yaml (the default;
       #                       backwards-compatible with every existing cell)
-      #   deployer=X (X!=helmfile) → <accelerator>-<intent>-X-config.yaml
+      #   platform=P       → <accelerator>-<intent>-P-config.yaml
+      #                      (platform=runai → h100-training-runai-config.yaml, #3302)
+      #   deployer=X (X!=helmfile) → <accelerator>-<intent>[-P]-X-config.yaml
       #                              (e.g. deployer=argocd → h100-training-argocd-config.yaml, issue #2194)
-      # Both variants drive the same cluster-config (GPU pool from the
+      # The platform segment comes before the deployer segment: it is a recipe
+      # coordinate, the deployer a variant of how the same recipe is installed.
+      # All variants drive the same cluster-config (GPU pool from the
       # reservation, system/CPU pools dynamic). The step-level check below asserts
-      # the resolved file exists so an unwired deployer variant fails early
-      # (before any provisioning) rather than deep in phase_prep.
+      # the resolved file exists so an unwired deployer or platform variant fails
+      # early (before any provisioning) rather than deep in phase_prep.
       TEST_CONFIG: >-
         ${{ inputs.test_config_dir }}/${{ inputs.accelerator }}-${{ inputs.intent }}${{
+          inputs.platform && format('-{0}', inputs.platform) || ''
+        }}${{
           inputs.deployer != 'helmfile' && format('-{0}', inputs.deployer) || ''
         }}-config.yaml
+      # Secrets Manager entry holding the Run:ai control-plane harness
+      # credential (platform=runai cells only; tests/uat/lib/runai-harness.sh
+      # documents its JSON). Read through the OIDC role this job already
+      # assumes; the lane reads no GitHub secret for it. Provisioned by
+      # infra/uat-aws-account.
+      RUNAI_HARNESS_SECRET_NAME: "aicr-uat-runai-harness"
       # v0.5.3 — carries deployment.stateLocation (mchmarny/cluster#51, first
       # released in v0.5.2), which decouples the S3 backend region from the
       # provider region. The GB300 lane needs it: the state bucket is named
@@ -280,6 +300,7 @@ jobs:
       - name: Validate inputs
         env:
           INTENT: ${{ inputs.intent }}
+          PLATFORM: ${{ inputs.platform }}
           LIFECYCLE: ${{ inputs.lifecycle }}
           SLUG: ${{ inputs.slug }}
           SLOT: ${{ inputs.slot }}
@@ -289,6 +310,21 @@ jobs:
           case "${INTENT}" in
             training|inference) ;;
             *) echo "::error::unknown intent '${INTENT}' (want training|inference)"; exit 1 ;;
+          esac
+          # Allowlist of the platform VALUES this lane admits (uat-run.yaml's
+          # resolve gate only answers whether the lane forwards one at all).
+          # runai is the Run:ai cell (#3302): same cluster, the recipe adds the
+          # Run:ai cluster side and the harness steps below register it with
+          # the control-plane fixture. The comparison is verbatim, no trimming
+          # or lowercasing, so a padded or capitalised value cannot alias the
+          # empty default and run a config nobody asked for.
+          case "${PLATFORM}" in
+            ''|runai) ;;
+            *)
+              echo "::error::unsupported platform: '${PLATFORM}' -- this lane admits runai or no platform."
+              echo "::error::Omit platform to run the default per-intent config."
+              exit 1
+              ;;
           esac
           case "${LIFECYCLE}" in
             nightly|daytime-up|daytime-down) ;;
@@ -357,7 +393,7 @@ jobs:
           if [[ "${LIFECYCLE}" != "daytime-down" && ! -f "${TEST_CONFIG}" ]]; then
             echo "::error::test config not found: ${TEST_CONFIG}"; exit 1
           fi
-          echo "intent=${INTENT} lifecycle=${LIFECYCLE} test-config=${TEST_CONFIG} cluster=${DEPLOYMENT_ID} account=${TENANCY}"
+          echo "intent=${INTENT} platform=${PLATFORM:-<none>} lifecycle=${LIFECYCLE} test-config=${TEST_CONFIG} cluster=${DEPLOYMENT_ID} account=${TENANCY}"
 
       # Versions
       - name: Load versions
@@ -792,6 +828,22 @@ jobs:
           echo "Verifying cluster connection..."
           kubectl get nodes
 
+      # Run:ai cells only (#3302): fetch the control-plane harness credential
+      # (service-account client id/secret, control-plane URL, optional CA) from
+      # Secrets Manager through the OIDC role assumed above and publish it to
+      # the phase steps as masked RUNAI_* variables. Lives in a step of its own
+      # so a missing or malformed fixture fails HERE, by name, before anything
+      # is registered. xtrace stays off: the payload is a credential.
+      - name: Read Run:ai harness credential
+        id: runai_credential
+        if: inputs.platform == 'runai' && steps.client.outcome == 'success' && inputs.skip_tests != true
+        shell: bash
+        run: |
+          set -euo pipefail
+          aws secretsmanager get-secret-value --region "${AWS_REGION}" \
+            --secret-id "${RUNAI_HARNESS_SECRET_NAME}" --query SecretString --output text \
+            | ./tests/uat/lib/runai-credential-export
+
       # UAT phases — each step invokes tests/uat/aws/run so the demo
       # (demos/cuj1-training.md) and CI stay in lockstep, and per-phase
       # failures surface as discrete steps in the GitHub Actions UI. Phases
@@ -833,7 +885,7 @@ jobs:
           aws-region: ${{ env.AWS_REGION }}
           role-session-name: GitHubActions-UAT-AICR-Install
 
-      - name: UAT - install (helmfile apply or argocd sync)
+      - name: UAT - install (helmfile apply, argocd sync or helm deploy.sh)
         id: install
         if: steps.prep.outcome == 'success'
         # Apply only; the readiness gate is its own step below (#2630), so a gate
@@ -845,9 +897,10 @@ jobs:
         #   argocd:   ARGOCD_HELM_TIMEOUT_SECONDS 5m
         #             + ARGOCD_SYNC_TIMEOUT_SECONDS 30m
         #             + ARGOCD_ROOT_APP_GRACE_SECONDS 2m = 37m         -> 45
+        #   helm (the runai cell's config): HELM_DEPLOY_TIMEOUT_SECONDS 40m -> 45
         # phase_install reads the deployer from the test config, not this input;
         # a mismatch fails fast at install_argocd's GITHUB_TOKEN guard below.
-        timeout-minutes: ${{ inputs.deployer == 'argocd' && 45 || 25 }}
+        timeout-minutes: ${{ (inputs.deployer == 'argocd' || inputs.platform == 'runai') && 45 || 25 }}
         shell: bash
         env:
           AICR_BIN: ${{ github.workspace }}/aicr
@@ -959,9 +1012,13 @@ jobs:
           aws-region: ${{ env.AWS_REGION }}
           role-session-name: GitHubActions-UAT-AICR-CUJ
 
+      # Not on the runai cell: its recipe ships no Kubeflow Trainer v2, so a
+      # TrainJob has no CRD there (cuj_phase_for maps runai to no CUJ, the same
+      # way `all` does); conformance covers that stack, gang scheduling in a
+      # Run:ai Project included.
       - name: UAT - train (TrainJob)
         id: train
-        if: steps.conformance.outcome == 'success' && inputs.intent == 'training'
+        if: steps.conformance.outcome == 'success' && inputs.intent == 'training' && inputs.platform != 'runai'
         timeout-minutes: 25
         shell: bash
         env:
@@ -1170,8 +1227,34 @@ jobs:
             train-logs/**
             serve-logs/**
             cluster-debug/**
+            runai-harness.json
           retention-days: 30
           if-no-files-found: ignore
+
+      # Run:ai cells only: delete the Project and the cluster record the
+      # harness created in the shared control-plane fixture (phase_unregister,
+      # tests/uat/lib/runai-harness.sh). Gated like Destroy Cluster: nightly
+      # always, daytime-up only when the run failed or was cancelled, so a
+      # held daytime cluster keeps its registration for the operator who
+      # inspects it (daytime-down cannot unregister it: the record's id lives
+      # in this run's workspace, so the operator deletes it in the control
+      # plane when done). A prep that never registered leaves no state and the
+      # phase is a no-op. Talks to the control plane only (no AWS call), so it
+      # needs no credential refresh. Runs before the summary so its outcome is
+      # in it.
+      - name: UAT - unregister (Run:ai cluster record + Project)
+        id: unregister
+        if: >-
+          always() && inputs.platform == 'runai' && steps.prep.outcome != 'skipped' && (
+            inputs.lifecycle == 'nightly' ||
+            (inputs.lifecycle == 'daytime-up' && (failure() || cancelled()))
+          )
+        timeout-minutes: 5
+        shell: bash
+        env:
+          AICR_BIN: ${{ github.workspace }}/aicr
+          RUN_ID: ${{ github.run_id }}
+        run: ./tests/uat/aws/run unregister "${TEST_CONFIG}"
 
       # Summary
       - name: Test Summary
@@ -1221,6 +1304,7 @@ jobs:
             echo "| Serve | disabled (vLLM excluded from UAT) |"
             echo "| Verify | ${{ steps.verify.outcome }} |"
             echo "| Fault injection | ${{ steps.faultinject.outcome }} |"
+            echo "| Run:ai unregister | ${{ steps.unregister.outcome }} |"
             if [[ -n "${{ steps.evidence_ref.outputs.ref }}" ]]; then
               echo ""
               echo "**Evidence (OCI):** \`${{ steps.evidence_ref.outputs.ref }}\`"
@@ -1415,4 +1499,4 @@ jobs:
     uses: ./.github/workflows/evidence-ingest.yaml
     with:
       bundle_ref: ${{ needs.uat-aws.outputs.bundle_ref }}
-      recipe: eks-h100-${{ inputs.intent }}
+      recipe: eks-h100-${{ inputs.intent }}${{ inputs.platform && format('-{0}', inputs.platform) || '' }}

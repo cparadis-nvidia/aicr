@@ -64,6 +64,10 @@ cuj_phase_for() {
 
     case "${platform}" in
         slurm) printf '%s' "none"; return 0 ;;
+        # Run:ai ships no Kubeflow Trainer v2 and no Dynamo, so neither CUJ
+        # applies; the Run:ai-native workload CUJ is a later phase of #3302 and
+        # conformance (gang-scheduling in a Run:ai Project) covers the stack.
+        runai) printf '%s' "none"; return 0 ;;
     esac
     case "${intent}" in
         inference) printf '%s' "serve" ;;

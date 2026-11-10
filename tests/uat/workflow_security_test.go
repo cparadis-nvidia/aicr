@@ -144,7 +144,7 @@ var actuatorStepNames = []string{"Bringup Infra", "Destroy Cluster"}
 // the install step (an addition invisible in an env-only diff) is caught by
 // TestCredentialBearingUATStepsDisableXtrace instead of leaking the token
 // into log lines.
-var awsTokenBearingStepNames = []string{"UAT - install (helmfile apply or argocd sync)"}
+var awsTokenBearingStepNames = []string{"UAT - install (helmfile apply, argocd sync or helm deploy.sh)"}
 
 type workflowDocument struct {
 	Env      map[string]string      `yaml:"env"`
@@ -592,6 +592,82 @@ func TestUATReadinessGateIsItsOwnStep(t *testing.T) {
 				strings.Contains(conformance.If, "steps.install.") {
 
 				t.Errorf("%s: conformance step must gate on readiness success, not install; got if: %q", tt.file, conformance.If)
+			}
+		})
+	}
+}
+
+// TestRunaiHarnessStepsAreGatedAndMasked pins the shape of the two steps the
+// platform=runai cells add to the EKS and GKE lanes (#3302): the credential
+// read must be gated on the runai platform, must publish through
+// tests/uat/lib/runai-credential-export (which masks the service-account
+// secret before it reaches GITHUB_ENV) and must never enable xtrace around
+// that payload; the
+// unregister step must run under always() so a failed phase still deletes the
+// cluster record and Project from the shared control plane, and only on the
+// lifecycles whose cluster is torn down, so a held daytime cluster keeps its
+// registration.
+func TestRunaiHarnessStepsAreGatedAndMasked(t *testing.T) {
+	const (
+		credentialStepName = "Read Run:ai harness credential"
+		unregisterStepName = "UAT - unregister (Run:ai cluster record + Project)"
+		platformGate       = "inputs.platform == 'runai'"
+	)
+	tests := []struct {
+		name  string
+		file  string
+		job   string
+		cloud string
+	}{
+		{"AWS", "uat-aws.yaml", "uat-aws", "aws"},
+		{"GCP", "uat-gcp.yaml", "uat-gcp", "gcp"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			workflow := decodeWorkflow(t, tt.file)
+			job, ok := workflow.Jobs[tt.job]
+			if !ok {
+				t.Fatalf("%s: missing job %q", tt.file, tt.job)
+			}
+
+			credential := uniqueStepNamed(t, job.Steps, credentialStepName)
+			if !strings.Contains(credential.If, platformGate) {
+				t.Errorf("%s: %q must be gated on %s, got if: %q", tt.file, credentialStepName, platformGate, credential.If)
+			}
+			if !strings.Contains(credential.If, "steps.client.outcome == 'success'") {
+				t.Errorf("%s: %q must run only once the cluster is reachable, got if: %q", tt.file, credentialStepName, credential.If)
+			}
+			if shellEnablesXtrace(credential.Run) || shellEnablesXtrace(credential.Shell) || shellEnvironmentEnablesXtrace(credential.Env) {
+				t.Errorf("%s: %q enables xtrace while handling the harness credential", tt.file, credentialStepName)
+			}
+			if !strings.Contains(credential.Run, "| ./tests/uat/lib/runai-credential-export") {
+				t.Errorf("%s: %q must publish the credential through tests/uat/lib/runai-credential-export, got run: %q", tt.file, credentialStepName, credential.Run)
+			}
+			for _, key := range []string{"GITHUB_TOKEN", "GH_TOKEN"} {
+				if _, ok := credential.Env[key]; ok {
+					t.Errorf("%s: %q must not receive %s", tt.file, credentialStepName, key)
+				}
+			}
+
+			unregister := uniqueStepNamed(t, job.Steps, unregisterStepName)
+			if unregister.ID != "unregister" {
+				t.Errorf("%s: step %q has id %q, want unregister", tt.file, unregisterStepName, unregister.ID)
+			}
+			for _, want := range []string{"always()", platformGate, "steps.prep.outcome != 'skipped'", "inputs.lifecycle == 'nightly'", "inputs.lifecycle == 'daytime-up' && (failure() || cancelled())"} {
+				if !strings.Contains(unregister.If, want) {
+					t.Errorf("%s: %q if must contain %q, got %q", tt.file, unregisterStepName, want, unregister.If)
+				}
+			}
+			wantRun := fmt.Sprintf(`./tests/uat/%s/run unregister "${TEST_CONFIG}"`, tt.cloud)
+			if !activeRunInvokesExactCommand(unregister.Run, wantRun) {
+				t.Errorf("%s: %q must run %q", tt.file, unregisterStepName, wantRun)
+			}
+
+			// The train CUJ has no CRD on a runai recipe (no Kubeflow Trainer v2
+			// there); the step must skip rather than fail the cell.
+			train := uniqueStepWithID(t, job.Steps, "train")
+			if !strings.Contains(train.If, "inputs.platform != 'runai'") {
+				t.Errorf("%s: train step must skip on platform=runai, got if: %q", tt.file, train.If)
 			}
 		})
 	}

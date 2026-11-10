@@ -30,7 +30,8 @@
 # the run.
 PLATFORM_WORKLOAD_CRD_MAP="dynamo:dynamographdeployments.nvidia.com
 kubeflow:trainjobs.trainer.kubeflow.org
-slurm:nodesets.slinky.slurm.net"
+slurm:nodesets.slinky.slurm.net
+runai:runaiconfigs.run.ai"
 
 # platform_workload_crd <platform>
 #

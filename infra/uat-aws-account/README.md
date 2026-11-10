@@ -51,6 +51,7 @@ terraform apply -var="aws_region=us-west-2"
 - **SSM**: read-only (`GetParameter*`)
 - **KMS**: EKS envelope encryption (`CreateGrant`, `DescribeKey`, `CreateAlias`, `DeleteAlias`)
 - **CloudWatch Logs**: EKS control plane logging
+- **Secrets Manager**: `GetSecretValue` on `aicr-uat-runai-harness` only — the Run:ai control-plane service account the `platform=runai` UAT cells authenticate with ([#3302](https://github.com/NVIDIA/aicr/issues/3302)). Terraform manages the secret container; its value is added out of band (`aws secretsmanager put-secret-value --secret-id aicr-uat-runai-harness --secret-string file://credential.json`, JSON `{"url","clientId","clientSecret","caCert"}`; see "The Run:ai lane" in `docs/contributor/uat.md`)
 
 **Privilege escalation explicitly denied**: `iam:CreateUser`, `iam:CreateLoginProfile`, `iam:AttachUserPolicy`, `iam:PutUserPolicy`, `iam:CreateAccessKey`.
 

@@ -83,16 +83,21 @@ on:
         options: [training, inference]
         default: training
       platform:
-        # Only run-kind forwards this. uat-aws/gcp/azure.yaml declare no
-        # platform input and build TEST_CONFIG from intent alone, so a
-        # non-empty value dispatched at a cloud reservation is INERT: that cell
-        # resolves its usual per-intent config and runs it. Nothing sets this
-        # but a manual dispatch (neither the nightly batch nor the daytime
-        # scheduler passes it), so the exposure is a hand-typed
+        # run-kind, run-aws and run-gcp forward this; uat-azure.yaml declares
+        # no platform input and builds TEST_CONFIG from intent alone, so a
+        # non-empty value dispatched at an Azure reservation would be INERT:
+        # that cell would resolve its usual per-intent config and run it. The
+        # resolve job below refuses that before anything is provisioned.
+        # Nothing sets this but a manual dispatch (neither the nightly batch
+        # nor the daytime scheduler passes it), so the exposure is a hand-typed
         # reservation/platform mismatch. actionlint rejects an empty string in
         # a choice's options, so this is a free-form string whose allowed
-        # values the kind lane bounds in its own `Validate inputs` step.
-        description: 'Recipe platform: appends a -<platform> segment to the test-config filename. Empty selects the default per-intent config. Only the kind lane supports a non-empty value today.'
+        # values each forwarding lane bounds in its own `Validate inputs`
+        # step (runai on the EKS and GKE lanes, #3302; none on kind).
+        description: >-
+          Recipe platform: appends a -<platform> segment to the test-config filename.
+          Empty selects the default per-intent config. runai is served by the EKS and
+          GKE lanes; the kind lane admits no value.
         type: string
         default: ''
       lifecycle:
@@ -324,8 +329,8 @@ jobs:
           ROW="$(./bin/uat-broker reservations --name "$RESERVATION")"
 
           # Fail closed on a platform the resolved lane cannot serve. Only
-          # run-kind forwards `platform` to its reusable pipeline; the other
-          # run-<cloud> jobs drop it, and uat-aws/gcp/azure.yaml build
+          # run-kind, run-aws and run-gcp forward `platform` to their reusable
+          # pipelines; run-azure drops it, and uat-azure.yaml builds
           # TEST_CONFIG from intent alone, so such a cell would resolve its
           # usual per-intent config, run it to completion and report SUCCESS
           # for a recipe nobody asked for. A false green is worse than a
@@ -346,18 +351,19 @@ jobs:
           # non-empty platform, not a list of rejected platform values, so a
           # platform added later is refused everywhere except the lanes listed
           # and a lane that gains a platform input gets an arm. WHICH values a
-          # listed lane accepts stays with that lane (uat-kind.yaml's
-          # `Validate inputs`), so the allowed set is written down once.
+          # listed lane accepts stays with that lane (each lane's `Validate
+          # inputs`: runai on uat-aws.yaml and uat-gcp.yaml, none on
+          # uat-kind.yaml), so each allowed set is written down once.
           if [[ -n "${PLATFORM}" ]]; then
             CLOUD="$(printf '%s\n' "${ROW}" | sed -n 's/^cloud=//p')"
             case "${CLOUD}" in
-              kind) ;;
+              kind|aws|gcp) ;;
               *)
                 echo "::error::platform='${PLATFORM}' cannot be served by the '${CLOUD:-<unresolved>}' lane (reservation '${RESERVATION}')."
-                echo "::error::Only run-kind forwards a platform to its pipeline. uat-${CLOUD:-<unresolved>}.yaml declares no"
+                echo "::error::Only run-kind, run-aws and run-gcp forward a platform to their pipelines. uat-${CLOUD:-<unresolved>}.yaml declares no"
                 echo "::error::platform input and builds TEST_CONFIG from intent alone, so this cell would run its"
                 echo "::error::default per-intent config and report success for a recipe that was not requested."
-                echo "::error::Dispatch a kind reservation, or omit platform to run this lane's default."
+                echo "::error::Dispatch an aws, gcp or kind reservation, or omit platform to run this lane's default."
                 exit 1
                 ;;
             esac
@@ -439,6 +445,7 @@ jobs:
       cluster_config_path: ${{ needs.resolve.outputs.cluster_config_path }}
       test_config_dir: ${{ needs.resolve.outputs.test_config_dir }}
       accelerator: ${{ needs.resolve.outputs.accelerator }}
+      platform: ${{ inputs.platform }}
       skip_delete: ${{ inputs.skip_delete }}
       skip_tests: ${{ inputs.skip_tests }}
       deployer: ${{ inputs.deployer }}
@@ -466,6 +473,7 @@ jobs:
       reservation: ${{ inputs.reservation }}
       aicr_version: ${{ inputs.aicr_version }}
       intent: ${{ inputs.intent }}
+      platform: ${{ inputs.platform }}
       lifecycle: ${{ inputs.lifecycle }}
       # Daytime cluster-name axes (ADR-017): slug from the resolved registry row,
       # slot from the dispatch input. Together with github.run_id they form

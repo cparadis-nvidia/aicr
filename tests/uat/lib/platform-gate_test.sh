@@ -16,20 +16,26 @@
 # Guards both gates on the `platform` dispatch axis:
 #
 #   A. .github/workflows/uat-run.yaml, `resolve` job, "Resolve reservation row".
-#      Answers "can this LANE serve a platform at all". Only run-kind forwards
-#      the input; uat-aws/gcp/azure.yaml declare no platform input and build
-#      TEST_CONFIG from intent alone, so a platform dispatched at a cloud
-#      reservation used to be dropped at the job boundary and that cell ran its
-#      default per-intent config to completion and reported SUCCESS for a recipe
-#      nobody asked for. Nothing on that path failed, because the default config
-#      exists, so the pipelines' own "test config not found" check never fired.
+#      Answers "can this LANE serve a platform at all". run-kind, run-aws and
+#      run-gcp forward the input; uat-azure.yaml declares no platform input and
+#      builds TEST_CONFIG from intent alone, so a platform dispatched at an
+#      Azure reservation would be dropped at the job boundary and that cell
+#      would run its default per-intent config to completion and report
+#      SUCCESS for a recipe nobody asked for. Nothing on that path fails,
+#      because the default config exists, so the pipeline's own "test config
+#      not found" check never fires. (Every cloud lane used to be in that
+#      position; the EKS and GKE lanes gained the input for runai, #3302.)
 #
-#   B. .github/workflows/uat-kind.yaml, `uat-kind` job, "Validate inputs".
-#      Answers "is this a value the kind lane admits", which today is the empty
-#      one and nothing else: that lane's cluster is single-node nvkind and the
-#      only platform in the tree, slurm, needs four schedulable nodes. Admitting
-#      it would spend a slot on a leased GPU runner before failing on three
-#      Pending slurmd pods. The cell runs on uat-kind-sim.yaml instead.
+#   B. Each forwarding lane's "Validate inputs". Answers "is this a value this
+#      lane admits":
+#        - uat-kind.yaml admits the empty one and nothing else: its cluster is
+#          single-node nvkind and the only other platform in the tree, slurm,
+#          needs four schedulable nodes. Admitting it would spend a slot on a
+#          leased GPU runner before failing on three Pending slurmd pods. The
+#          cell runs on uat-kind-sim.yaml instead.
+#        - uat-aws.yaml and uat-gcp.yaml admit the empty one and runai, the
+#          Run:ai cell (#3302), whose h100-training-runai-config.yaml they
+#          carry.
 #
 # The two are deliberately separate: A is per-lane, B is per-value. Asserting
 # both here keeps them from being merged into one duplicated list that drifts.
@@ -55,6 +61,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 RUN_WORKFLOW="${REPO_ROOT}/.github/workflows/uat-run.yaml"
 KIND_WORKFLOW="${REPO_ROOT}/.github/workflows/uat-kind.yaml"
+AWS_WORKFLOW="${REPO_ROOT}/.github/workflows/uat-aws.yaml"
+GCP_WORKFLOW="${REPO_ROOT}/.github/workflows/uat-gcp.yaml"
 
 fail=0
 check() {
@@ -73,6 +81,8 @@ command -v yq >/dev/null 2>&1 || abort "yq is not on PATH; it is required to ext
 command -v go >/dev/null 2>&1 || abort "go is not on PATH; the extracted build step builds tools/uat-broker from source"
 [[ -f "${RUN_WORKFLOW}" ]] || abort "workflow not found: ${RUN_WORKFLOW}"
 [[ -f "${KIND_WORKFLOW}" ]] || abort "workflow not found: ${KIND_WORKFLOW}"
+[[ -f "${AWS_WORKFLOW}" ]] || abort "workflow not found: ${AWS_WORKFLOW}"
+[[ -f "${GCP_WORKFLOW}" ]] || abort "workflow not found: ${GCP_WORKFLOW}"
 
 WORK="$(mktemp -d)" || abort "could not create a temporary directory"
 trap 'rm -rf "${WORK}"' EXIT
@@ -100,12 +110,18 @@ extract_step() {
 BUILD_STEP="${WORK}/build-step.sh"
 RESOLVE_STEP="${WORK}/resolve-step.sh"
 KIND_STEP="${WORK}/kind-validate-step.sh"
+AWS_STEP="${WORK}/aws-validate-step.sh"
+GCP_STEP="${WORK}/gcp-validate-step.sh"
 extract_step "${RUN_WORKFLOW}" '.jobs.resolve' 'Build uat-broker' \
              "${BUILD_STEP}" 'tools/uat-broker'
 extract_step "${RUN_WORKFLOW}" '.jobs.resolve' 'Resolve reservation row' \
              "${RESOLVE_STEP}" 'uat-broker reservations'
 extract_step "${KIND_WORKFLOW}" '.jobs["uat-kind"]' 'Validate inputs' \
              "${KIND_STEP}" 'unsupported platform'
+extract_step "${AWS_WORKFLOW}" '.jobs["uat-aws"]' 'Validate inputs' \
+             "${AWS_STEP}" 'unsupported platform'
+extract_step "${GCP_WORKFLOW}" '.jobs["uat-gcp"]' 'Validate inputs' \
+             "${GCP_STEP}" 'unsupported platform'
 
 # ---------------------------------------------------------------------------
 # Gate A: uat-run.yaml, can this lane serve a platform at all
@@ -144,15 +160,15 @@ for pair in "aws-h100:aws" "gcp-h100:gcp" "azure-h100:azure" "kind-h100:kind"; d
 done
 
 # REJECT: a non-empty platform at a lane that cannot serve it. These are the
-# false-green dispatches gate A exists to stop.
-check "aws lane rejects platform=slurm"   "reject" "$(lane_verdict aws-h100 slurm)"
-check "gcp lane rejects platform=slurm"   "reject" "$(lane_verdict gcp-h100 slurm)"
+# false-green dispatches gate A exists to stop. Azure is the one cloud lane
+# that still declares no platform input.
 check "azure lane rejects platform=slurm" "reject" "$(lane_verdict azure-h100 slurm)"
+check "azure lane rejects platform=runai" "reject" "$(lane_verdict azure-h100 runai)"
 
 # Gate A is an ALLOWLIST of lanes, not a denylist of platform values. These two
 # discriminate the shapes: a denylist naming slurm would let both through.
-check "aws lane rejects platform=kubeflow, not just slurm" "reject" "$(lane_verdict aws-h100 kubeflow)"
-check "aws lane rejects a platform that exists nowhere"    "reject" "$(lane_verdict aws-h100 nosuch)"
+check "azure lane rejects platform=kubeflow, not just slurm" "reject" "$(lane_verdict azure-h100 kubeflow)"
+check "azure lane rejects a platform that exists nowhere"    "reject" "$(lane_verdict azure-h100 nosuch)"
 
 # ACCEPT: every path that must keep working. The four empty-platform cases are
 # the backward-compatibility guarantee for every cell that predates this input.
@@ -161,12 +177,18 @@ check "gcp lane accepts an empty platform"   "accept" "$(lane_verdict gcp-h100 '
 check "azure lane accepts an empty platform" "accept" "$(lane_verdict azure-h100 '')"
 check "kind lane accepts an empty platform"  "accept" "$(lane_verdict kind-h100 '')"
 check "kind lane accepts platform=slurm"     "accept" "$(lane_verdict kind-h100 slurm)"
+check "aws lane accepts platform=runai"      "accept" "$(lane_verdict aws-h100 runai)"
+check "gcp lane accepts platform=runai"      "accept" "$(lane_verdict gcp-h100 runai)"
 
 # Deliberate division of responsibility: gate A answers "can this LANE serve a
-# platform at all", gate B answers "is this a value the kind lane has a config
-# for". Asserting the accept here pins that split.
+# platform at all", gate B answers "is this a value the lane has a config
+# for". Asserting the accepts here pins that split for every forwarding lane.
 check "kind lane accepts an unknown platform, value validation is gate B's job" \
     "accept" "$(lane_verdict kind-h100 nosuch)"
+check "aws lane accepts an unknown platform, value validation is gate B's job" \
+    "accept" "$(lane_verdict aws-h100 nosuch)"
+check "gcp lane accepts an unknown platform, value validation is gate B's job" \
+    "accept" "$(lane_verdict gcp-h100 nosuch)"
 
 # What actually stops a cloud lane from starting is that no `cloud` output is
 # published on the rejected path, NOT that the step exits non-zero: run-aws,
@@ -174,7 +196,7 @@ check "kind lane accepts an unknown platform, value validation is gate B's job" 
 # With no output, their `needs.resolve.outputs.cloud == '<cloud>'` compares the
 # empty string against a literal and cannot match. Asserting the absence keeps
 # a future edit from moving the publish back above the gate.
-run_resolve aws-h100 slurm
+run_resolve azure-h100 slurm
 check "a rejected dispatch publishes NO row at all" "0" \
     "$(wc -l < "${WORK}/row.txt" | tr -d ' ')"
 check "a rejected dispatch publishes no cloud output" "0" \
@@ -185,7 +207,7 @@ check "a rejected dispatch publishes no cloud output" "0" \
 check "the rejection names the platform" "1" \
     "$(grep -c "platform='slurm'" "${WORK}/step.log")"
 check "the rejection names the resolved lane" "1" \
-    "$(grep -c "'aws' lane" "${WORK}/step.log")"
+    "$(grep -c "'azure' lane" "${WORK}/step.log")"
 
 # ---------------------------------------------------------------------------
 # Gate C: uat-run.yaml, can this cell compose an NVSentinel remediation mixin
@@ -278,6 +300,56 @@ check "the kind rejection points at the lane that serves the cell" "1" \
 # what catches an admitted platform whose config was never added.
 check "kind lane rejects an admitted platform whose config is missing" \
     "reject" "$(value_verdict '' 'tests/uat/kind/tests/does-not-exist.yaml')"
+
+# ---------------------------------------------------------------------------
+# Gate B, cloud lanes: uat-aws.yaml and uat-gcp.yaml admit runai and nothing else
+# ---------------------------------------------------------------------------
+
+# Both steps are run verbatim with the job-level env they read: the cloud
+# cluster-config (in-repo), a TEST_CONFIG that exists so a rejection can only
+# come from the platform allowlist, and a scratch GITHUB_ENV for the account
+# and region exports the aws step writes before its lifecycle gates.
+AWS_CONFIG="tests/uat/aws/tests/h100-training-runai-config.yaml"
+GCP_CONFIG="tests/uat/gcp/tests/h100-training-runai-config.yaml"
+[[ -f "${REPO_ROOT}/${AWS_CONFIG}" ]] || abort "fixture missing: ${AWS_CONFIG}"
+[[ -f "${REPO_ROOT}/${GCP_CONFIG}" ]] || abort "fixture missing: ${GCP_CONFIG}"
+
+run_cloud() { # <aws|gcp> <platform> [test-config]
+    local cloud="$1" platform="$2" cfg="${3:-}" step cluster_cfg
+    : > "${WORK}/github.env"
+    case "${cloud}" in
+        aws) step="${AWS_STEP}"; cluster_cfg="tests/uat/aws/cluster-config.yaml"; cfg="${cfg:-${AWS_CONFIG}}" ;;
+        gcp) step="${GCP_STEP}"; cluster_cfg="tests/uat/gcp/cluster-config.yaml"; cfg="${cfg:-${GCP_CONFIG}}" ;;
+    esac
+    ( cd "${REPO_ROOT}" \
+      && INTENT=training PLATFORM="${platform}" LIFECYCLE=nightly SLUG=ah1 SLOT=0 \
+         DEPLOYER=helmfile TEST_CONFIG="${cfg}" CLUSTER_CONFIG="${cluster_cfg}" \
+         DEPLOYMENT_ID=aicr-uat-test GITHUB_ENV="${WORK}/github.env" \
+         bash "${step}" ) > "${WORK}/${cloud}.log" 2>&1
+}
+cloud_verdict() {
+    if run_cloud "$@"; then echo accept; else echo reject; fi
+}
+
+for cloud in aws gcp; do
+    check "${cloud} allowlist accepts an empty platform" "accept" "$(cloud_verdict "${cloud}" '')"
+    check "${cloud} allowlist accepts runai"             "accept" "$(cloud_verdict "${cloud}" runai)"
+    # An allowlist of the values this lane admits, not a denylist: every other
+    # value in the tree, and every value that exists nowhere, is refused.
+    check "${cloud} allowlist rejects slurm"    "reject" "$(cloud_verdict "${cloud}" slurm)"
+    check "${cloud} allowlist rejects kubeflow" "reject" "$(cloud_verdict "${cloud}" kubeflow)"
+    check "${cloud} allowlist rejects a platform that exists nowhere" "reject" "$(cloud_verdict "${cloud}" nosuch)"
+    # Verbatim comparison, as on the kind lane: no normalization may map a
+    # padded or capitalised value onto an admitted one.
+    check "${cloud} allowlist rejects Runai"                    "reject" "$(cloud_verdict "${cloud}" Runai)"
+    check "${cloud} allowlist rejects a leading-space platform" "reject" "$(cloud_verdict "${cloud}" ' runai')"
+    run_cloud "${cloud}" Runai
+    check "the ${cloud} rejection names the offending value" "1" \
+        "$(grep -c "unsupported platform: 'Runai'" "${WORK}/${cloud}.log")"
+    # The file-existence check stays behind the allowlist, fail-closed.
+    check "${cloud} lane rejects an admitted platform whose config is missing" \
+        "reject" "$(cloud_verdict "${cloud}" runai "tests/uat/${cloud}/tests/does-not-exist.yaml")"
+done
 
 if [[ "${fail}" -ne 0 ]]; then
     echo "FAILED" >&2

@@ -26,6 +26,15 @@ cluster lifecycle management (create, connect, destroy):
 All bindings use `google_project_iam_member` (additive), so they cannot conflict
 with `gcp-shared`'s bindings on the same service account.
 
+`runai-harness.tf` adds the Secret Manager secret `aicr-uat-runai-harness`,
+the Run:ai control-plane service account the `platform=runai` UAT cells
+authenticate with ([#3302](https://github.com/NVIDIA/aicr/issues/3302)), plus a
+per-secret `roles/secretmanager.secretAccessor` binding for the service
+account. Terraform manages the container only; the value is added out of band
+(`gcloud secrets versions add aicr-uat-runai-harness --data-file=credential.json`,
+JSON `{"url","clientId","clientSecret","caCert"}`; see "The Run:ai lane" in
+`docs/contributor/uat.md`).
+
 ## Evidence-dashboard read SA (GP5)
 
 `evidence-dashboard.tf` adds a dedicated **read-only** service account,
